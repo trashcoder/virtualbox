@@ -124,6 +124,11 @@ Rules for adding a changelog entry to make them look more uniform:
       </listitem>
 
       <listitem>
+        <para>Windows Guest Additions: Fixed out-of-order replies when a
+          legacy Shared Clipboard request could not be queued</para>
+      </listitem>
+
+      <listitem>
         <para>placeholder</para>
       </listitem>
 

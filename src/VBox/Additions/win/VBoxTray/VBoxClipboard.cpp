@@ -1154,6 +1154,27 @@ static DECLCALLBACK(int) vbtrShClReadThread(RTTHREAD hThread, void *pvUser)
 
 
 /**
+ * Completes a read that could not be queued.
+ *
+ * @param   pCtx                Shared clipboard context.
+ * @param   pEvent              Clipboard read event.
+ * @param   pfShutdown          Host message worker's shutdown indicator.
+ */
+static void vbtrShClRejectRead(PSHCLCONTEXT pCtx, PVBGLR3CLIPBOARDEVENT pEvent, bool volatile *pfShutdown)
+{
+    /* Without a context ID, the host matches replies to requests in format
+       order. Wait for the reader to send all earlier replies first. */
+    if (pEvent->cmdCtx.fUseLegacyProtocol)
+        while (   ASMAtomicReadU32(&pCtx->cReadRequests) != 0
+               && !ASMAtomicReadBool(pfShutdown))
+            RTThreadSleep(100 /* ms */);
+
+    if (!ASMAtomicReadBool(pfShutdown))
+        VbglR3ClipboardWriteDataEx(&pEvent->cmdCtx, pEvent->u.fReadData, NULL, 0);
+}
+
+
+/**
  * @interface_method_impl{VBOXTRAYSVCDESC,pfnWorker}
  */
 DECLCALLBACK(int) vbtrShClWorker(void *pvInstance, bool volatile *pfShutdown)
@@ -1301,7 +1322,7 @@ DECLCALLBACK(int) vbtrShClWorker(void *pvInstance, bool volatile *pfShutdown)
                     {
                         LogRelMax(16, ("*** Error: Shared Clipboard: Dispatching host data request for format %#x failed with %Rrc\n",
                                        pEvent->u.fReadData, rcRead));
-                        VbglR3ClipboardWriteDataEx(&pEvent->cmdCtx, pEvent->u.fReadData, NULL, 0);
+                        vbtrShClRejectRead(pCtx, pEvent, pfShutdown);
                     }
                     break;
                 }
