@@ -118,6 +118,11 @@ Rules for adding a changelog entry to make them look more uniform:
       </listitem>
 
       <listitem>
+        <para>Windows Guest Additions: Fixed slow clipboard reads blocking
+          subsequent Shared Clipboard updates</para>
+      </listitem>
+
+      <listitem>
         <para>placeholder</para>
       </listitem>
 

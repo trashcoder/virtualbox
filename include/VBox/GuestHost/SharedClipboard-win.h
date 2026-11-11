@@ -74,8 +74,6 @@ using namespace com;
 
 /** Reports clipboard formats. */
 #define SHCL_WIN_WM_REPORT_FORMATS          WM_USER
-/** Reads data from the clipboard and sends it to the destination. */
-#define SHCL_WIN_WM_READ_DATA               WM_USER + 1
 #ifdef VBOX_WITH_SHARED_CLIPBOARD_TRANSFERS
 /** Starts a transfer on the guest.
  *  This creates the necessary IDataObject in the matching window thread. */
