@@ -40,6 +40,7 @@
 #include <iprt/errcore.h>
 #include <iprt/ldr.h>
 #include <iprt/mem.h>
+#include <iprt/semaphore.h>
 #include <iprt/utf16.h>
 
 #include <VBox/GuestHost/SharedClipboard.h>
@@ -86,6 +87,25 @@ struct SHCLCONTEXT
     SHCLTRANSFERCTX       TransferCtx;
 #endif
 };
+
+
+/** An isolated Windows clipboard read, shared by the reader and its caller. */
+typedef struct VBTRSHCLREADJOB
+{
+    /** Reference count for the caller and the Windows clipboard thread. */
+    uint32_t volatile cRefs;
+    /** Signaled when the result is ready. */
+    RTSEMEVENT        hDone;
+    /** Windows clipboard format to read. */
+    UINT              uFormat;
+    /** Owned copy of the clipboard data, if available. */
+    void             *pvData;
+    /** Size of the copied data. */
+    uint32_t          cbData;
+    /** Windows error from opening or locking the clipboard, if any. */
+    DWORD             dwError;
+} VBTRSHCLREADJOB;
+typedef VBTRSHCLREADJOB *PVBTRSHCLREADJOB;
 
 
 /*********************************************************************************************************************************
@@ -929,8 +949,85 @@ DECLCALLBACK(int) vbtrShClInit(const PVBOXTRAYSVCENV pEnv, void **ppvInstance)
 }
 
 /**
- * Reads a requested format on a separate thread so that Windows delayed
- * rendering cannot block the clipboard window's message loop.
+ * Releases a reference to a Windows clipboard read job.
+ *
+ * @param   pJob                Clipboard read job.
+ */
+static void vbtrShClReadJobRelease(PVBTRSHCLREADJOB pJob)
+{
+    if (ASMAtomicDecU32(&pJob->cRefs) == 0)
+    {
+        RTSemEventDestroy(pJob->hDone);
+        RTMemFree(pJob->pvData);
+        RTMemFree(pJob);
+    }
+}
+
+
+/**
+ * Fetches Windows clipboard data without depending on the clipboard service
+ * or its logger. Windows can still be rendering data when VBoxTray shuts down.
+ *
+ * @returns VBox status code.
+ * @param   hThread             Current thread.
+ * @param   pvUser              Clipboard read job, with one reference for this thread.
+ */
+static DECLCALLBACK(int) vbtrShClFetchClipboard(RTTHREAD hThread, void *pvUser)
+{
+    RT_NOREF(hThread);
+    PVBTRSHCLREADJOB const pJob = (PVBTRSHCLREADJOB)pvUser;
+
+    /* Match ShClWinOpen's bounded retry without accessing the service logger. */
+    for (uint32_t i = 0; ; i++)
+    {
+        if (ASMAtomicReadU32(&pJob->cRefs) == 1)
+            break;
+        if (OpenClipboard(NULL))
+        {
+            HANDLE hClip = GetClipboardData(pJob->uFormat);
+            if (hClip && ASMAtomicReadU32(&pJob->cRefs) > 1)
+            {
+                const void *pvClip = GlobalLock(hClip);
+                if (pvClip)
+                {
+                    size_t cbClip = GlobalSize(hClip);
+                    if (pJob->uFormat == CF_UNICODETEXT)
+                    {
+                        size_t cwcActual;
+                        int rc = RTUtf16NLenEx((PCRTUTF16)pvClip, cbClip / sizeof(RTUTF16), &cwcActual);
+                        cbClip = RT_SUCCESS(rc) ? (cwcActual + 1) * sizeof(RTUTF16) : 0;
+                    }
+                    if (cbClip > 0 && cbClip <= UINT32_MAX)
+                    {
+                        pJob->pvData = RTMemDup(pvClip, cbClip);
+                        if (pJob->pvData)
+                            pJob->cbData = (uint32_t)cbClip;
+                    }
+                    GlobalUnlock(hClip);
+                }
+                else
+                    pJob->dwError = GetLastError();
+            }
+            CloseClipboard();
+            break;
+        }
+        if (i == 10)
+        {
+            pJob->dwError = GetLastError();
+            break;
+        }
+        RTThreadSleep(1U << i);
+    }
+
+    RTSemEventSignal(pJob->hDone);
+    vbtrShClReadJobRelease(pJob);
+    return VINF_SUCCESS;
+}
+
+
+/**
+ * Completes a host read request in order. The wait can end at shutdown while
+ * the Windows-only thread still owns its job.
  *
  * @param   pCtx                Shared clipboard context.
  * @param   pEvent              Clipboard read event, owned by this request.
@@ -945,73 +1042,87 @@ static DECLCALLBACK(void) vbtrShClReadData(PSHCLCONTEXT pCtx, PVBGLR3CLIPBOARDEV
     }
 
     SHCLFORMAT const fFormat = pEvent->u.fReadData;
-
-    void *pvData = NULL;
-    uint32_t cbData = 0;
-    int rc = ShClWinOpen(NULL);
-    if (RT_SUCCESS(rc))
+    UINT uFormat = 0;
+    bool fHtml = false;
+    if (fFormat & VBOX_SHCL_FMT_BITMAP)
+        uFormat = CF_DIB;
+    else if (fFormat & VBOX_SHCL_FMT_UNICODETEXT)
+        uFormat = CF_UNICODETEXT;
+    else if (fFormat & VBOX_SHCL_FMT_HTML)
     {
-        UINT uFormat = 0;
-        bool fHtml = false;
-        if (fFormat & VBOX_SHCL_FMT_BITMAP)
-            uFormat = CF_DIB;
-        else if (fFormat & VBOX_SHCL_FMT_UNICODETEXT)
-            uFormat = CF_UNICODETEXT;
-        else if (fFormat & VBOX_SHCL_FMT_HTML)
-        {
-            uFormat = RegisterClipboardFormat(SHCL_WIN_REGFMT_HTML);
-            fHtml = true;
-        }
+        uFormat = RegisterClipboardFormat(SHCL_WIN_REGFMT_HTML);
+        fHtml = true;
+    }
 
-        HANDLE hClip = uFormat ? GetClipboardData(uFormat) : NULL;
-        if (hClip)
+    PVBTRSHCLREADJOB pJob = NULL;
+    int rc = VERR_NOT_SUPPORTED;
+    if (uFormat)
+    {
+        pJob = (PVBTRSHCLREADJOB)RTMemAllocZ(sizeof(*pJob));
+        rc = VERR_NO_MEMORY;
+        if (pJob)
         {
-            const void *pvClip = GlobalLock(hClip);
-            if (pvClip)
+            pJob->cRefs = 1;
+            pJob->uFormat = uFormat;
+            rc = RTSemEventCreate(&pJob->hDone);
+            if (RT_SUCCESS(rc))
             {
-                size_t cbClip = GlobalSize(hClip);
-                if (uFormat == CF_UNICODETEXT)
+                pJob->cRefs = 2;
+                rc = RTThreadCreate(NULL, vbtrShClFetchClipboard, pJob, 0, RTTHREADTYPE_IO, 0, "shclfetch");
+                if (RT_SUCCESS(rc))
                 {
-                    size_t cwcActual;
-                    rc = RTUtf16NLenEx((PCRTUTF16)pvClip, cbClip / sizeof(RTUTF16), &cwcActual);
-                    if (RT_SUCCESS(rc))
-                        cbClip = (cwcActual + 1) * sizeof(RTUTF16);
+                    do
+                        rc = RTSemEventWait(pJob->hDone, 100 /* ms */);
+                    while (rc == VERR_TIMEOUT && !ASMAtomicReadBool(&pCtx->fShutdown));
                 }
-                if (RT_SUCCESS(rc) && cbClip > 0 && cbClip <= UINT32_MAX)
-                {
-                    const char *pszClip = (const char *)pvClip;
-                    if (   fHtml
-                        && RTStrNLen(pszClip, cbClip) < cbClip
-                        && ShClWinIsCFHTML(pszClip))
-                    {
-                        char *pszMime = NULL;
-                        if (RT_SUCCESS(ShClWinConvertCFHTMLToMIME(pszClip, (uint32_t)cbClip, &pszMime, &cbData)))
-                            pvData = pszMime;
-                    }
-
-                    if (!pvData)
-                    {
-                        pvData = RTMemDup(pvClip, cbClip);
-                        if (pvData)
-                            cbData = (uint32_t)cbClip;
-                    }
-                }
-                GlobalUnlock(hClip);
+                else
+                    vbtrShClReadJobRelease(pJob);
             }
             else
-                LogRelMax(16, ("*** Error: Shared Clipboard: Locking Windows clipboard data in format %#x failed with %Rrc\n",
-                               fFormat, RTErrConvertFromWin32(GetLastError())));
+            {
+                RTMemFree(pJob);
+                pJob = NULL;
+            }
         }
-        ShClWinClose();
     }
-    else if (rc != VERR_ACCESS_DENIED)
-        LogRelMax(16, ("*** Error: Shared Clipboard: Opening the Windows clipboard for host format %#x failed with %Rrc\n",
-                       fFormat, rc));
 
-    /* Reply after closing the Windows clipboard. An empty reply completes a failed read. */
     if (!ASMAtomicReadBool(&pCtx->fShutdown))
+    {
+        void *pvData = NULL;
+        uint32_t cbData = 0;
+        char *pszMime = NULL;
+        if (RT_SUCCESS(rc))
+        {
+            pvData = pJob->pvData;
+            cbData = pJob->cbData;
+            if (pJob->dwError && pJob->dwError != ERROR_ACCESS_DENIED)
+                LogRelMax(16, ("*** Error: Shared Clipboard: Reading Windows clipboard format %#x failed with %Rrc\n",
+                               fFormat, RTErrConvertFromWin32(pJob->dwError)));
+
+            const char *pszClip = (const char *)pvData;
+            if (   fHtml
+                && pszClip
+                && RTStrNLen(pszClip, cbData) < cbData
+                && ShClWinIsCFHTML(pszClip))
+            {
+                uint32_t cbMime = 0;
+                if (RT_SUCCESS(ShClWinConvertCFHTMLToMIME(pszClip, cbData, &pszMime, &cbMime)))
+                {
+                    pvData = pszMime;
+                    cbData = cbMime;
+                }
+            }
+        }
+        else if (rc != VERR_NOT_SUPPORTED)
+            LogRelMax(16, ("*** Error: Shared Clipboard: Starting or waiting for Windows clipboard format %#x failed with %Rrc\n",
+                           fFormat, rc));
+
+        /* An empty reply completes a failed read. */
         VbglR3ClipboardWriteDataEx(&pEvent->cmdCtx, fFormat, pvData, cbData);
-    RTMemFree(pvData);
+        RTMemFree(pszMime);
+    }
+    if (pJob)
+        vbtrShClReadJobRelease(pJob);
     VbglR3ClipboardEventFree(pEvent);
     ASMAtomicDecU32(&pCtx->cReadRequests);
 }
@@ -1309,6 +1420,7 @@ DECLCALLBACK(void) vbtrShClDestroy(void *pvInstance)
 
     if (pCtx->hReadThread != NIL_RTTHREAD)
     {
+        /* The read worker can leave its wait even if Windows is still rendering clipboard data. */
         ASMAtomicWriteBool(&pCtx->fReadShutdown, true);
         int rc = RTThreadWait(pCtx->hReadThread, RT_INDEFINITE_WAIT, NULL);
         AssertRC(rc);
